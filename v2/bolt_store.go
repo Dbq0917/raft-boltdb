@@ -41,6 +41,9 @@ type BoltStore struct {
 	path string
 
 	msgpackUseNewTimeFormat bool
+
+	// retention coordinates snapshot readers with log compaction.
+	retention logRetentionState
 }
 
 // Options contains all the configuration used to open the Bbolt
@@ -232,6 +235,17 @@ func (b *BoltStore) StoreLogs(logs []*raft.Log) error {
 
 // DeleteRange is used to delete logs within a given range inclusively.
 func (b *BoltStore) DeleteRange(min, max uint64) error {
+	if min > max {
+		return nil
+	}
+
+	// Snapshot readers hold leases while they consume log entries. The lock
+	// covers the check-and-delete transaction, but never snapshot generation
+	// itself, so compaction can still make progress in parallel.
+	b.retention.mu.Lock()
+	defer b.retention.mu.Unlock()
+
+	protected := b.retention.protectedRanges(min, max)
 	minKey := uint64ToBytes(min)
 
 	tx, err := b.conn.Begin(true)
@@ -241,10 +255,20 @@ func (b *BoltStore) DeleteRange(min, max uint64) error {
 	defer tx.Rollback()
 
 	curs := tx.Bucket(dbLogs).Cursor()
+	protectedIdx := 0
 	for k, _ := curs.Seek(minKey); k != nil; k, _ = curs.Next() {
+		idx := bytesToUint64(k)
+
 		// Handle out-of-range log index
-		if bytesToUint64(k) > max {
+		if idx > max {
 			break
+		}
+
+		for protectedIdx < len(protected) && protected[protectedIdx].max < idx {
+			protectedIdx++
+		}
+		if protectedIdx < len(protected) && protected[protectedIdx].min <= idx {
+			continue
 		}
 
 		// Delete in-range log index

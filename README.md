@@ -10,6 +10,89 @@ here](https://github.com/hashicorp/raft).
 This implementation uses [BoltDB](https://github.com/boltdb/bolt). BoltDB is
 a simple key/value store implemented in pure Go, and inspired by LMDB.
 
+## Snapshot-Safe Log Retention
+
+Snapshot generation and log compaction do not need to be serialized in this
+store. A snapshot reader can lease the log range it needs while compaction
+continues to delete logs outside that range:
+
+```go
+first, err := store.FirstIndex()
+if err != nil {
+	return err
+}
+last, err := store.LastIndex()
+if err != nil {
+	return err
+}
+
+lease, err := store.AcquireLogLease(first, last)
+if err != nil {
+	// A concurrent compaction won the race. Read the new bounds and retry
+	// snapshot creation; do not read a partial range.
+	return err
+}
+
+// Keep the lease until the snapshot has been written, synced, and atomically
+// published. Releasing earlier allows compaction to invalidate its source.
+defer lease.Release()
+
+logs, err := store.ReadLogRange(first, last)
+if err != nil {
+	return err
+}
+
+return writeAndPublishSnapshot(logs)
+```
+
+`AcquireLogLease` validates the complete range and registers the lease
+atomically with respect to `DeleteRange`. If compaction already removed any
+part of the range, it returns a `LogRangeUnavailableError` containing the
+missing index and current log bounds. `DeleteRange` deletes unprotected
+subranges and skips only the leased indexes, so neither task waits for the
+other to finish. Skipped indexes remain available for a later `DeleteRange`
+after the lease is released.
+
+Leases are process-local and do not hold a database transaction. The crash
+safety rule is ordering: acquire before reading, and release only after the
+snapshot contents and the directory entry that publishes them are durable. A
+crash before release leaves the referenced logs intact; a crash after release
+cannot lose a snapshot that was already published.
+
+## Recovery Planning
+
+`PlanRecovery` distinguishes a replayable suffix from a missing segment:
+
+```go
+plan, err := store.PlanRecovery(snapshotIndex)
+if err != nil {
+	return err
+}
+if plan.SnapshotRequired {
+	// Keep the current FSM. Obtain and install a snapshot whose index is at
+	// least plan.MinSnapshotIndex, then call PlanRecovery again.
+	return retryWithSnapshot(plan.MinSnapshotIndex)
+}
+if plan.ReplayFrom != 0 {
+	lease, err := store.AcquireLogLease(plan.ReplayFrom, plan.ReplayTo)
+	if err != nil {
+		// Compaction changed the bounds after planning. Re-plan and retry.
+		return err
+	}
+	defer lease.Release()
+
+	logs, err := store.ReadLogRange(plan.ReplayFrom, plan.ReplayTo)
+	if err != nil {
+		return err
+	}
+	replay(logs)
+}
+```
+
+When `MissingFrom` is set, recovery should retry through a newer snapshot
+rather than rebuilding the state machine from scratch. `Retryable` reports this
+case (and the no-state case) so callers can apply a bounded retry with backoff.
+
 ## Metrics Emission and Compatibility
 
 This library can emit metrics using either `github.com/armon/go-metrics` or `github.com/hashicorp/go-metrics`. Choosing between the libraries is controlled via build tags. 
