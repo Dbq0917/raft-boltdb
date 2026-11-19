@@ -5,6 +5,25 @@ This implementation uses the maintained version of BoltDB, [BBolt](https://githu
 
 There is no breaking API change to the library. However, there is the potential for disk format incompatibilities so it was decided to be conservative and making it a separate import path. This separate import path will allow both versions (original and v2) to be imported to perform a safe in-place upgrade of old files read with the old version and written back out with the new one. 
 
+## Durability and Fsync Batching
+
+`StoreLog`, `StoreLogs`, `Set`, and `DeleteRange` return success only after
+the write transaction has been committed and the required `fsync` has
+completed. A failed write or `fsync`, including one caused by a full disk, is
+returned to every caller whose write was part of that transaction.
+
+Writes submitted concurrently are committed together. All callers sharing a
+commit receive their result only after the group has been committed and
+synced, while the group pays for one `fsync` instead of one per caller.
+`NoSync` selects whether Bolt performs that sync inside each transaction or
+whether the store performs it after the grouped commit; acknowledged writes
+remain durable in either mode.
+
+There is no way to acknowledge a single sequential append before it is durable.
+If appends arrive one at a time and each must be acknowledged before the next,
+each append still requires one sync. Grouping improves throughput when writes
+overlap, as they commonly do with Raft replication.
+
 ## Metrics Emission and Compatibility
 
 This library can emit metrics using either `github.com/armon/go-metrics` or `github.com/hashicorp/go-metrics`. Choosing between the libraries is controlled via build tags. 

@@ -5,10 +5,14 @@ package raftboltdb
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +51,188 @@ func TestBoltStore_Implements(t *testing.T) {
 	}
 	if _, ok := store.(raft.LogStore); !ok {
 		t.Fatalf("BoltStore does not implement raft.LogStore")
+	}
+}
+
+func TestBoltStore_NoSyncSyncFailureIsReturned(t *testing.T) {
+	fh, err := ioutil.TempFile("", "bolt")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	os.Remove(fh.Name())
+	defer os.Remove(fh.Name())
+
+	store, err := New(Options{Path: fh.Name(), NoSync: true})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer store.Close()
+
+	syncErr := errors.New("disk full")
+	store.syncFn = func() error {
+		return syncErr
+	}
+
+	if err := store.StoreLog(testRaftLog(1, "log1")); !errors.Is(err, syncErr) {
+		t.Fatalf("expected sync error, got: %v", err)
+	}
+}
+
+func TestBoltStore_NoSyncAcknowledgedLogsSurviveReopen(t *testing.T) {
+	fh, err := ioutil.TempFile("", "bolt")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	os.Remove(fh.Name())
+	defer os.Remove(fh.Name())
+
+	store, err := New(Options{Path: fh.Name(), NoSync: true})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	var syncs atomic.Int32
+	store.syncFn = func() error {
+		syncs.Add(1)
+		return store.conn.Sync()
+	}
+
+	const logCount = 16
+	for i := 1; i <= logCount; i++ {
+		if err := store.StoreLog(testRaftLog(uint64(i), fmt.Sprintf("log%d", i))); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+	}
+	if got := syncs.Load(); got != logCount {
+		t.Fatalf("expected %d syncs, got %d", logCount, got)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	reopened, err := NewBoltStore(fh.Name())
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer reopened.Close()
+
+	for i := 1; i <= logCount; i++ {
+		var log raft.Log
+		if err := reopened.GetLog(uint64(i), &log); err != nil {
+			t.Fatalf("log %d missing after reopen: %v", i, err)
+		}
+	}
+}
+
+func TestBoltStore_ConcurrentWritesShareSync(t *testing.T) {
+	fh, err := ioutil.TempFile("", "bolt")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	os.Remove(fh.Name())
+	defer os.Remove(fh.Name())
+
+	store, err := New(Options{Path: fh.Name(), NoSync: true})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer store.Close()
+
+	const concurrentLogs = 32
+	firstSync := make(chan struct{})
+	releaseFirstSync := make(chan struct{})
+	var syncs atomic.Int32
+	store.syncFn = func() error {
+		if syncs.Add(1) == 1 {
+			close(firstSync)
+			<-releaseFirstSync
+		}
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrentLogs+1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errs <- store.StoreLog(testRaftLog(1, "log1"))
+	}()
+
+	<-firstSync
+
+	start := make(chan struct{})
+	for i := 2; i <= concurrentLogs+1; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs <- store.StoreLog(testRaftLog(uint64(i), fmt.Sprintf("log%d", i)))
+		}(i)
+	}
+	close(start)
+
+	// Let all callers reach the unbuffered write queue before the first commit
+	// finishes. They must then be collected into the next shared commit.
+	time.Sleep(10 * time.Millisecond)
+	close(releaseFirstSync)
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+	}
+
+	if got := syncs.Load(); got != 2 {
+		t.Fatalf("expected 2 group syncs, got %d", got)
+	}
+}
+
+func TestBoltStore_CloseWaitsForPendingWrite(t *testing.T) {
+	fh, err := ioutil.TempFile("", "bolt")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	os.Remove(fh.Name())
+	defer os.Remove(fh.Name())
+
+	store, err := New(Options{Path: fh.Name(), NoSync: true})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	syncStarted := make(chan struct{})
+	releaseSync := make(chan struct{})
+	store.syncFn = func() error {
+		close(syncStarted)
+		<-releaseSync
+		return nil
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- store.StoreLog(testRaftLog(1, "log1"))
+	}()
+	<-syncStarted
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- store.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the pending write completed: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	close(releaseSync)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("err: %s", err)
 	}
 }
 
