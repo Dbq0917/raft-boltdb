@@ -10,6 +10,38 @@ here](https://github.com/hashicorp/raft).
 This implementation uses [BoltDB](https://github.com/boltdb/bolt). BoltDB is
 a simple key/value store implemented in pure Go, and inspired by LMDB.
 
+## Bounded Log Reclaim
+
+`BoundedStore` wraps a `BoltStore` with a size cap on the raft log. Instead
+of reclaiming space synchronously in the write path once the log is full
+(which turns microsecond writes into millisecond writes at the cap), reclaim
+runs in a background goroutine in parallel with writes and starts early,
+once the estimated log size crosses a high watermark.
+
+The arbitration between reclaim and writes is defined as follows:
+
+* Writes always have priority: they never wait while the store is below the
+  hard cap, and background reclaim yields to them between batches.
+* Only at the hard cap does the order flip: a write waits for reclaim to
+  free space first, and reclaim runs at full speed until it has.
+* Reclaim never deletes the newest `MinRetainLogs` entries, so no log entry
+  is lost because of reclaim. If every remaining entry is protected, the cap
+  yields to retention and writes proceed instead of blocking forever.
+
+```go
+base, err := raftboltdb.New(raftboltdb.Options{Path: "raft.db"})
+if err != nil {
+    // handle error
+}
+store, err := raftboltdb.NewBoundedStore(base, raftboltdb.ReclaimOptions{
+    MaxLogBytes: 1 << 30, // 1 GiB hard cap on the raft log
+})
+if err != nil {
+    // handle error
+}
+// Use store as the raft LogStore/StableStore; close it instead of base.
+```
+
 ## Metrics Emission and Compatibility
 
 This library can emit metrics using either `github.com/armon/go-metrics` or `github.com/hashicorp/go-metrics`. Choosing between the libraries is controlled via build tags. 
@@ -65,3 +97,14 @@ The following table details all the metrics emitted by this library. One note is
 | `raft.boltdb.txstats.write`         | writes       | counter | Counts the number of writes to the db since Consul was started. |
 | `raft.boltdb.txstats.writeTime`     | ms           | timer   | Measures the amount of time spent performing writes to the db. |
 | `raft.boltdb.writeCapacity`         | logs/second  | sample  | Theoretical write capacity in terms of the number of logs that can be written per second. Each sample outputs what the capacity would be if future batched log write operations were similar to this one. This similarity encompasses 4 things: batch size, byte size, disk performance and boltdb performance. While none of these will be static and its highly likely individual samples of this metric will vary, aggregating this metric over a larger time window should provide a decent picture into how this BoltDB store can perform |
+
+`BoundedStore` emits the following additional metrics:
+
+| Metric                              | Unit         | Type    | Description           |
+| ----------------------------------- | ------------:| -------:|:--------------------- |
+| `raft.boltdb.bounded.logBytes`      | bytes        | gauge   | Estimated number of bytes currently held by the raft log bucket, tracked against the configured cap. |
+| `raft.boltdb.bounded.blockedWrites` | writes       | counter | Counts the number of write batches that had to wait for reclaim at the hard cap. |
+| `raft.boltdb.bounded.blockedTime`   | ms           | sample  | Measures how long a blocked write waited for reclaim to free space at the hard cap. |
+| `raft.boltdb.bounded.reclaimedLogs` | logs         | counter | Counts the number of log entries deleted by background reclaim. |
+| `raft.boltdb.bounded.reclaimedBytes`| bytes        | counter | Counts the number of bytes freed by background reclaim. |
+| `raft.boltdb.bounded.reclaimBatch`  | ms           | timer   | Measures the time spent in a single background reclaim transaction. |
