@@ -10,6 +10,26 @@ here](https://github.com/hashicorp/raft).
 This implementation uses [BoltDB](https://github.com/boltdb/bolt). BoltDB is
 a simple key/value store implemented in pure Go, and inspired by LMDB.
 
+## Crash-Safe Log Deletion
+
+Writing a snapshot and deleting the logs it covers are two separate actions,
+usually on different call paths. If the process is killed in between, the
+logs can be gone while the snapshot was never persisted, losing both copies
+of the data. To make the ordering safe without changing how snapshots are
+produced, the store offers a durable snapshot barrier:
+
+1. The snapshot path calls `SetSnapshotBarrier(index)` after the snapshot
+   covering all logs up to `index` has been fully persisted. The barrier
+   must only move forward.
+2. `DeleteRange` reads the barrier inside the same transaction as the
+   deletion and refuses to compact the head of the log past it. Deletions
+   of the log tail (e.g. truncating conflicting entries during raft
+   replication) are never blocked.
+
+With the barrier in place, a crash at any point leaves at least one
+recoverable copy: either the durable snapshot or the not-yet-deleted logs.
+If no barrier is ever recorded, `DeleteRange` behaves exactly as before.
+
 ## Metrics Emission and Compatibility
 
 This library can emit metrics using either `github.com/armon/go-metrics` or `github.com/hashicorp/go-metrics`. Choosing between the libraries is controlled via build tags. 

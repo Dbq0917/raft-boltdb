@@ -366,6 +366,101 @@ func TestBoltStore_DeleteRange(t *testing.T) {
 	}
 }
 
+func TestBoltStore_SnapshotBarrier(t *testing.T) {
+	store := testBoltStore(t)
+	defer os.Remove(store.path)
+
+	// Defaults to zero when no barrier was recorded
+	if barrier, err := store.GetSnapshotBarrier(); err != nil || barrier != 0 {
+		t.Fatalf("bad: %d, %v", barrier, err)
+	}
+
+	// Record and read back a barrier
+	if err := store.SetSnapshotBarrier(8); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if barrier, err := store.GetSnapshotBarrier(); err != nil || barrier != 8 {
+		t.Fatalf("bad: %d, %v", barrier, err)
+	}
+	store.Close()
+}
+
+// TestBoltStore_DeleteRangeCrash simulates a kill between the snapshot
+// action and the log deletion action. The snapshot barrier is persisted
+// before the simulated crash, so after a restart the deletion must leave
+// every log not covered by the durable snapshot in place.
+func TestBoltStore_DeleteRangeCrash(t *testing.T) {
+	store := testBoltStore(t)
+	path := store.path
+	defer os.Remove(path)
+
+	// Create a set of logs
+	logs := make([]*raft.Log, 0, 10)
+	for i := uint64(1); i <= 10; i++ {
+		logs = append(logs, testRaftLog(i, "log"))
+	}
+	if err := store.StoreLogs(logs); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// The snapshot path finishes and records its barrier, then the
+	// process is killed before the log deletion path runs.
+	if err := store.SetSnapshotBarrier(8); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Restart: the barrier must survive the crash
+	store, err := NewBoltStore(path)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer store.Close()
+	if barrier, err := store.GetSnapshotBarrier(); err != nil || barrier != 8 {
+		t.Fatalf("bad: %d, %v", barrier, err)
+	}
+
+	// The deletion path asks to delete more than the snapshot covers;
+	// only the logs covered by the durable snapshot may be removed.
+	if err := store.DeleteRange(1, 10); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := store.GetLog(8, new(raft.Log)); err != raft.ErrLogNotFound {
+		t.Fatalf("should have deleted log8")
+	}
+	for _, idx := range []uint64{9, 10} {
+		if err := store.GetLog(idx, new(raft.Log)); err != nil {
+			t.Fatalf("log%d must survive: %s", idx, err)
+		}
+	}
+
+	// Deleting the tail, as happens when truncating conflicting entries
+	// during replication, must not be blocked by the barrier.
+	if err := store.DeleteRange(10, 10); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := store.GetLog(10, new(raft.Log)); err != raft.ErrLogNotFound {
+		t.Fatalf("should have deleted log10")
+	}
+
+	// Once the next snapshot is durable and the barrier advances, the
+	// remaining logs can be deleted.
+	if err := store.SetSnapshotBarrier(9); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := store.DeleteRange(1, 10); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if err := store.GetLog(9, new(raft.Log)); err != raft.ErrLogNotFound {
+		t.Fatalf("should have deleted log9")
+	}
+	if first, err := store.FirstIndex(); err != nil || first != 0 {
+		t.Fatalf("bad: %d, %v", first, err)
+	}
+}
+
 func TestBoltStore_Set_Get(t *testing.T) {
 	store := testBoltStore(t)
 	defer store.Close()

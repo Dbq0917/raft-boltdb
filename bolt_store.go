@@ -24,6 +24,10 @@ var (
 	dbLogs = []byte("logs")
 	dbConf = []byte("conf")
 
+	// dbSnapshotBarrier is the conf key holding the snapshot barrier: the
+	// highest log index known to be covered by a fully persisted snapshot.
+	dbSnapshotBarrier = []byte("snapshot-barrier")
+
 	// An error indicating a given key does not exist
 	ErrKeyNotFound = errors.New("not found")
 )
@@ -232,7 +236,35 @@ func (b *BoltStore) StoreLogs(logs []*raft.Log) error {
 	return tx.Commit()
 }
 
+// SetSnapshotBarrier records that a snapshot covering all logs up to and
+// including index has been fully persisted. It must only be called after
+// the snapshot is durable, and index must only move forward. This is the
+// ordering primitive that lets a snapshot path and a log deletion path
+// running independently of each other guarantee that at least one copy
+// of the data (the snapshot or the logs) survives a crash at any point.
+func (b *BoltStore) SetSnapshotBarrier(index uint64) error {
+	return b.SetUint64(dbSnapshotBarrier, index)
+}
+
+// GetSnapshotBarrier returns the index recorded by SetSnapshotBarrier,
+// or 0 if no barrier has been recorded yet.
+func (b *BoltStore) GetSnapshotBarrier() (uint64, error) {
+	val, err := b.GetUint64(dbSnapshotBarrier)
+	if err == ErrKeyNotFound {
+		return 0, nil
+	}
+	return val, err
+}
+
 // DeleteRange is used to delete logs within a given range inclusively.
+//
+// If a snapshot barrier has been recorded (see SetSnapshotBarrier) and the
+// range starts at or before the first stored log, i.e. it is a compaction
+// of the log head, the range is clamped to the barrier so that logs not
+// yet covered by a durable snapshot are never deleted. Deletions of the
+// log tail, such as truncating conflicting entries during replication,
+// are not affected. The barrier is read inside the same transaction as
+// the deletion, so the check and the delete are atomic.
 func (b *BoltStore) DeleteRange(min, max uint64) error {
 	minKey := uint64ToBytes(min)
 
@@ -246,7 +278,20 @@ func (b *BoltStore) DeleteRange(min, max uint64) error {
 		}
 	}()
 
-	curs := tx.Bucket(dbLogs).Cursor()
+	logs := tx.Bucket(dbLogs)
+
+	// Clamp head compactions to the snapshot barrier so a crash can never
+	// leave us with the logs gone but no durable snapshot covering them.
+	if raw := tx.Bucket(dbConf).Get(dbSnapshotBarrier); raw != nil {
+		if barrier := bytesToUint64(raw); max > barrier {
+			curs := logs.Cursor()
+			if first, _ := curs.First(); first != nil && min <= bytesToUint64(first) {
+				max = barrier
+			}
+		}
+	}
+
+	curs := logs.Cursor()
 	for k, _ := curs.Seek(minKey); k != nil; k, _ = curs.Next() {
 		// Handle out-of-range log index
 		if bytesToUint64(k) > max {
