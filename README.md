@@ -10,6 +10,43 @@ here](https://github.com/hashicorp/raft).
 This implementation uses [BoltDB](https://github.com/boltdb/bolt). BoltDB is
 a simple key/value store implemented in pure Go, and inspired by LMDB.
 
+## Follower-Aware Log Retention
+
+Raft snapshot compaction truncates the local log up to the snapshot index.
+Truncating purely on the leader's own progress is unsafe for replication: if a
+follower has not acknowledged the last entries before they are deleted, its
+next `AppendEntries` request fails and the leader must transfer a full
+snapshot, which can take a long time over a cross-datacenter link.
+
+`RetentionGuard` tracks the highest log index each follower has acknowledged
+and wraps the log store so `DeleteRange` can never cross that boundary:
+
+```go
+guard := raftboltdb.NewRetentionGuard(raftboltdb.RetentionConfig{
+    Voters:          5,    // cluster size including the leader
+    MaxLogSpan:      4096, // disk-safety backstop
+    MinRetainedLogs: 1024, // mirrors raft TrailingLogs
+})
+
+store, err := raftboltdb.NewBoltStore(path)
+if err != nil {
+    // handle err
+}
+logStore := raftboltdb.NewGuardedLogStore(store, guard)
+```
+
+Feed replication progress from successful `AppendEntries` responses
+(`resp.LastLog`) into `guard.ReportAck(peerID, matchIndex)`. The default
+`AckPolicyAll` gates compaction on the slowest follower that has ever reported,
+so every replica keeps catching up by log replay. A follower that has never
+reported does not block truncation.
+
+`MaxLogSpan` is the other side of the boundary: a permanently stalled follower
+cannot pin the log forever. Once the retained span exceeds it, older entries
+are compacted anyway and that follower resyncs through a snapshot instead.
+`AckPolicyQuorum` is available when quorum durability is sufficient and a
+smaller retained log is preferred.
+
 ## Metrics Emission and Compatibility
 
 This library can emit metrics using either `github.com/armon/go-metrics` or `github.com/hashicorp/go-metrics`. Choosing between the libraries is controlled via build tags. 
