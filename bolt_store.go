@@ -11,6 +11,7 @@ import (
 	"github.com/boltdb/bolt"
 	metrics "github.com/hashicorp/go-metrics"
 	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft-boltdb/prealloc"
 )
 
 const (
@@ -37,6 +38,16 @@ type BoltStore struct {
 
 	// The path to the Bolt database file
 	path string
+
+	// preallocMgr, when non-nil, reserves file space in bounded chunks ahead
+	// of writes so bolt never performs an expensive doubling grow on the
+	// request path. It is nil when preallocation is disabled or in read-only
+	// mode.
+	preallocMgr *prealloc.Manager
+
+	// writeWatermark tracks the cumulative logical bytes handed to the store,
+	// independently of the on-disk file size, so reservations stay linear.
+	writeWatermark int64
 }
 
 // Options contains all the configuration used to open the BoltDB
@@ -52,6 +63,15 @@ type Options struct {
 	// write to the log. This is unsafe, so it should be used
 	// with caution.
 	NoSync bool
+
+	// PreAllocateChunkSize controls on-demand file preallocation. When greater
+	// than zero, the data file grows in fixed-size chunks reserved ahead of the
+	// write position (via fallocate where supported) rather than relying on
+	// bolt's doubling mmap strategy. This bounds the latency of any single
+	// growth step so a large log cannot stall the write path long enough to
+	// trigger a Raft election timeout. A zero value keeps bolt's default
+	// behavior. Values below 1 MiB are rejected.
+	PreAllocateChunkSize int64
 }
 
 // readOnly returns true if the contained bolt options say to open
@@ -61,6 +81,15 @@ func (o *Options) readOnly() bool {
 	return o != nil && o.BoltOptions != nil && o.BoltOptions.ReadOnly
 }
 
+// validatePreAllocateChunkSize rejects chunk sizes small enough that growth
+// would effectively be triggered on every write.
+func validatePreAllocateChunkSize(chunkSize int64) error {
+	if chunkSize < prealloc.MinChunkSize() {
+		return prealloc.ErrInvalidChunkSize
+	}
+	return nil
+}
+
 // NewBoltStore takes a file path and returns a connected Raft backend.
 func NewBoltStore(path string) (*BoltStore, error) {
 	return New(Options{Path: path})
@@ -68,6 +97,12 @@ func NewBoltStore(path string) (*BoltStore, error) {
 
 // New uses the supplied options to open the BoltDB and prepare it for use as a raft backend.
 func New(options Options) (*BoltStore, error) {
+	if options.PreAllocateChunkSize > 0 {
+		if err := validatePreAllocateChunkSize(options.PreAllocateChunkSize); err != nil {
+			return nil, err
+		}
+	}
+
 	// Try to connect
 	handle, err := bolt.Open(options.Path, dbFileMode, options.BoltOptions)
 	if err != nil {
@@ -83,6 +118,16 @@ func New(options Options) (*BoltStore, error) {
 
 	// If the store was opened read-only, don't try and create buckets
 	if !options.readOnly() {
+		if options.PreAllocateChunkSize > 0 {
+			// Use a dedicated descriptor so reservations run independently of
+			// bolt's handle and only ever extend the shared inode.
+			mgr, err := prealloc.NewManager(options.Path, options.PreAllocateChunkSize)
+			if err != nil {
+				store.Close()
+				return nil, err
+			}
+			store.preallocMgr = mgr
+		}
 		// Set up our buckets
 		if err := store.initialize(); err != nil {
 			store.Close()
@@ -117,6 +162,11 @@ func (b *BoltStore) initialize() error {
 
 // Close is used to gracefully close the DB connection.
 func (b *BoltStore) Close() error {
+	if b.preallocMgr != nil {
+		// Closing the manager only releases its own descriptor; bolt's handle
+		// is closed below.
+		defer b.preallocMgr.Close()
+	}
 	return b.conn.Close()
 }
 
@@ -229,7 +279,24 @@ func (b *BoltStore) StoreLogs(logs []*raft.Log) error {
 		metrics.MeasureSince([]string{"raft", "boltdb", "storeLogs"}, now)
 	}()
 
+	if b.preallocMgr != nil {
+		if err := b.reserveForWrite(int64(batchSize)); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit()
+}
+
+// reserveForWrite makes sure the file has backing storage for the pages bolt
+// is about to commit. Reservations follow the cumulative logical write
+// position rather than the on-disk file size, keeping growth linear in the
+// data actually written. By the time bolt grows, the target range is already
+// allocated and its truncate becomes a cheap metadata operation.
+func (b *BoltStore) reserveForWrite(incoming int64) error {
+	b.writeWatermark += incoming
+	_, err := b.preallocMgr.Reserve(b.writeWatermark)
+	return err
 }
 
 // DeleteRange is used to delete logs within a given range inclusively.

@@ -30,6 +30,26 @@ To migrate an application currently using the older `armon/go-metrics` to instea
 
    Eventually once the default behavior changes to use `hashicorp/go-metrics` by default (mid-2025), you can drop the `hashicorpmetrics` build tag.
 
+## Chunked File Preallocation
+
+By default bbolt grows its data file by doubling the memory map up to 1 GiB and then in 1 GiB steps, and every grow issues a `truncate` plus a full-file `fsync`. When the Raft log is large and the backing store is an ordinary cloud disk, a single grow can block the write path for hundreds of milliseconds—long enough to trip a Raft election timeout and force a leader election.
+
+Set `Options.PreAllocateChunkSize` to reserve file space on demand in fixed-size, bounded chunks instead:
+
+```go
+store, err := raftboltdb.New(raftboltdb.Options{
+    Path:                 "raft.db",
+    PreAllocateChunkSize: 64 * 1024 * 1024, // 64 MiB
+})
+```
+
+Behavior and guarantees:
+
+* Space is reserved ahead of the write position through a dedicated file descriptor, using `fallocate` where the filesystem supports it (with an automatic `ftruncate` fallback, e.g. on tmpfs). The cost of one grow is bounded by the chunk size rather than the whole file.
+* Growth is linear in the bytes actually written; the reservation high-water mark is tracked independently of bbolt's file size, so preallocation never inherits the doubling behavior.
+* Reservations only ever extend the file and never modify or discard bytes below the high-water mark, so already acknowledged log entries are not lost. Reopening an existing file resumes from its current size without re-reserving or copying the populated prefix.
+* A zero value (the default) preserves bbolt's original behavior, and values below 1 MiB are rejected.
+
 ## Metrics
 
 The following table details all the metrics emitted by this library. One note is that the application which pulls in this library may add its own prefix to the metric names. For example within [Consul](https://github.com/hashicorp/consul), the metrics will be prefixed with `consul.`.
